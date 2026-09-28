@@ -1,0 +1,127 @@
+# =============================================================================
+#  Pipeline DevSecOps — Formation (exemple pédagogique)
+#  À placer dans .github/workflows/ de VOTRE projet.
+#
+#  Ce pipeline reproduit, dans l'ordre "shift-left", les 6 étapes de la journée :
+#    1. Secrets   (Gitleaks)      — Lab 1
+#    2. SAST      (Semgrep)       — Lab 2
+#    3. SCA + Image (Trivy)       — Labs 3 & 4
+#    4. IaC       (Trivy config)  — Lab 5
+#    5. DAST      (OWASP ZAP)     — Lab 6
+#
+#  Principe clé : chaque job est une "gate". S'il trouve un problème critique,
+#  il fait ÉCHOUER le pipeline → le code ne part pas en production.
+# =============================================================================
+
+name: DevSecOps Pipeline
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+
+# Droits minimaux (bonne pratique : principe du moindre privilège)
+permissions:
+  contents: read
+  security-events: write   # pour publier les rapports SARIF dans l'onglet Security
+
+jobs:
+
+  # ---------------------------------------------------------------------------
+  # ÉTAPE 1 — SECRETS (Lab 1)
+  # ---------------------------------------------------------------------------
+  secrets:
+    name: 🔑 Secrets (Gitleaks)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0        # historique complet → Gitleaks scanne tous les commits
+      - name: Scan des secrets
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # ---------------------------------------------------------------------------
+  # ÉTAPE 2 — SAST (Lab 2)
+  # ---------------------------------------------------------------------------
+  sast:
+    name: 🔎 SAST (Semgrep)
+    runs-on: ubuntu-latest
+    container:
+      image: semgrep/semgrep       # image officielle avec semgrep préinstallé
+    steps:
+      - uses: actions/checkout@v4
+      - name: Analyse statique + rapport SARIF
+        run: |
+          semgrep scan \
+            --config p/owasp-top-ten --config p/javascript --config p/typescript \
+            --sarif --output semgrep.sarif --metrics=off
+      - name: Publier les résultats dans l'onglet Security
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: semgrep.sarif
+
+  # ---------------------------------------------------------------------------
+  # ÉTAPE 3 — SCA + IMAGE (Labs 3 & 4)
+  # ---------------------------------------------------------------------------
+  build-and-scan-image:
+    name: 📦 Build + Scan image (Trivy)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Construire l'image Docker
+        run: docker build -t mon-app:${{ github.sha }} .
+
+      - name: Scan de l'image (dépendances + OS)
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: mon-app:${{ github.sha }}
+          format: table
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          exit-code: '1'          # ⛔ GATE : échoue si CVE critique corrigeable
+
+  # ---------------------------------------------------------------------------
+  # ÉTAPE 4 — IaC (Lab 5)
+  # ---------------------------------------------------------------------------
+  iac:
+    name: 🏗️ IaC (Trivy config)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Scan des fichiers d'infrastructure
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: config
+          scan-ref: .
+          severity: CRITICAL,HIGH
+          exit-code: '1'          # ⛔ GATE : échoue si misconfig critique
+
+  # ---------------------------------------------------------------------------
+  # ÉTAPE 5 — DAST (Lab 6)
+  # Ne tourne qu'APRÈS un build d'image réussi : on démarre l'app puis on l'attaque.
+  # ---------------------------------------------------------------------------
+  dast:
+    name: 🕷️ DAST (OWASP ZAP)
+    runs-on: ubuntu-latest
+    needs: build-and-scan-image
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Démarrer l'application à tester
+        run: |
+          docker run -d --name app -p 3000:3000 bkimminich/juice-shop:v20.2.0
+          # attendre que l'app réponde
+          for i in $(seq 1 30); do
+            curl -fs http://localhost:3000 && break || sleep 3
+          done
+
+      - name: ZAP Baseline Scan (passif)
+        uses: zaproxy/action-baseline@v0.12.0
+        with:
+          target: 'http://localhost:3000'
+          # rules_file_name: '.zap/rules.tsv'   # pour ignorer certaines alertes
+          cmd_options: '-a'

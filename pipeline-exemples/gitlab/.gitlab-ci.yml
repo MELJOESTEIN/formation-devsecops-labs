@@ -1,0 +1,89 @@
+# =============================================================================
+#  Pipeline DevSecOps — Formation (exemple pédagogique, GitLab CI)
+#  À placer à la racine de VOTRE projet sous le nom .gitlab-ci.yml
+#
+#  Mêmes étapes "shift-left" que la journée :
+#    secrets → sast → sca/image → iac → dast
+#  Chaque job qui trouve un problème critique fait ÉCHOUER le pipeline.
+# =============================================================================
+
+stages:
+  - secrets
+  - sast
+  - image
+  - iac
+  - dast
+
+# -----------------------------------------------------------------------------
+# ÉTAPE 1 — SECRETS (Lab 1) — Gitleaks
+# -----------------------------------------------------------------------------
+secrets:
+  stage: secrets
+  image:
+    name: zricethezav/gitleaks:latest
+    entrypoint: [""]
+  script:
+    - gitleaks dir . --no-banner --redact --report-format sarif --report-path gitleaks.sarif
+  artifacts:
+    when: always
+    paths: [ gitleaks.sarif ]
+
+# -----------------------------------------------------------------------------
+# ÉTAPE 2 — SAST (Lab 2) — Semgrep
+# -----------------------------------------------------------------------------
+sast:
+  stage: sast
+  image: semgrep/semgrep
+  script:
+    - semgrep scan --config p/owasp-top-ten --config p/javascript --config p/typescript
+        --sarif --output semgrep.sarif --metrics=off
+  artifacts:
+    when: always
+    paths: [ semgrep.sarif ]
+
+# -----------------------------------------------------------------------------
+# ÉTAPE 3 — SCA + IMAGE (Labs 3 & 4) — Trivy
+# -----------------------------------------------------------------------------
+build_and_scan_image:
+  stage: image
+  image: docker:27
+  services:
+    - docker:27-dind          # Docker-in-Docker pour builder l'image
+  variables:
+    IMAGE: "mon-app:$CI_COMMIT_SHORT_SHA"
+  script:
+    - docker build -t "$IMAGE" .
+    # installer trivy
+    - apk add --no-cache curl
+    - curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin
+    # GATE : échoue si CVE critique corrigeable
+    - trivy image --severity CRITICAL,HIGH --ignore-unfixed --exit-code 1 "$IMAGE"
+
+# -----------------------------------------------------------------------------
+# ÉTAPE 4 — IaC (Lab 5) — Trivy config
+# -----------------------------------------------------------------------------
+iac:
+  stage: iac
+  image:
+    name: aquasec/trivy:latest
+    entrypoint: [""]
+  script:
+    - trivy config --severity CRITICAL,HIGH --exit-code 1 .
+
+# -----------------------------------------------------------------------------
+# ÉTAPE 5 — DAST (Lab 6) — OWASP ZAP baseline
+# -----------------------------------------------------------------------------
+dast:
+  stage: dast
+  image: ghcr.io/zaproxy/zaproxy:stable
+  variables:
+    TARGET: "http://app:3000"
+  services:
+    - name: bkimminich/juice-shop:v20.2.0
+      alias: app
+  script:
+    # -I : ne pas faire échouer le job sur les WARN (on ajuste la politique ensuite)
+    - zap-baseline.py -t "$TARGET" -r zap-report.html -I
+  artifacts:
+    when: always
+    paths: [ zap-report.html ]
